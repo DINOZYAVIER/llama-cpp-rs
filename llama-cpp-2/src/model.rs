@@ -15,9 +15,9 @@ use crate::openai::{ChatParseStateOaicompat, OpenAIChatTemplateParams};
 use crate::token::LlamaToken;
 use crate::token_type::{LlamaTokenAttr, LlamaTokenAttrs};
 use crate::{
-    status_is_ok, status_to_i32, ApplyChatTemplateError, ChatParseError, ChatTemplateError,
-    LlamaContextLoadError, LlamaLoraAdapterInitError, LlamaModelLoadError, MetaValError,
-    NewLlamaChatMessageError, StringToTokenError, TokenToStringError,
+    status_is_ok, ApplyChatTemplateError, ChatParseError, ChatTemplateError, LlamaContextLoadError,
+    LlamaLoraAdapterInitError, LlamaModelLoadError, MetaValError, NewLlamaChatMessageError,
+    StringToTokenError, TokenToStringError,
 };
 
 pub mod params;
@@ -137,8 +137,8 @@ pub struct ChatTemplateResult {
     pub chat_format: i32,
     /// Optional serialized PEG parser for tool-call parsing.
     pub parser: Option<String>,
-    /// Whether the parser expects a forced-open thinking block.
-    pub thinking_forced_open: bool,
+    /// Prefix that must be prepended for parser-compatible response reconstruction.
+    pub generation_prompt: String,
     /// Whether tool calls should be parsed from the response.
     pub parse_tool_calls: bool,
 }
@@ -266,12 +266,12 @@ impl LlamaModel {
     ) -> Result<String, TokenToStringError> {
         // TODO lsptrip None is acutally not quite the origignal behavior of this function,
         let mut decoder = encoding_rs::UTF_8.new_decoder();
-        Ok(self.token_to_piece(
+        self.token_to_piece(
             token,
             &mut decoder,
             matches!(special, Special::Tokenize),
             None,
-        )?)
+        )
     }
 
     /// Convert single token to bytes.
@@ -916,6 +916,10 @@ impl LlamaModel {
             )
         };
 
+        if res < 0 {
+            return Err(ApplyChatTemplateError::FfiError(res));
+        }
+
         if res > buff.len().try_into().expect("Buffer size exceeds i32::MAX") {
             buff.resize(res.try_into().expect("res is negative"), 0);
 
@@ -929,6 +933,9 @@ impl LlamaModel {
                     buff.len().try_into().expect("Buffer size exceeds i32::MAX"),
                 )
             };
+            if res < 0 {
+                return Err(ApplyChatTemplateError::FfiError(res));
+            }
             assert_eq!(Ok(res), buff.len().try_into());
         }
         buff.truncate(res.try_into().expect("res is negative"));
@@ -962,8 +969,8 @@ impl LlamaModel {
             prompt: ptr::null_mut(),
             grammar: ptr::null_mut(),
             parser: ptr::null_mut(),
+            generation_prompt: ptr::null_mut(),
             chat_format: 0,
-            thinking_forced_open: false,
             grammar_lazy: false,
             grammar_triggers: ptr::null_mut(),
             grammar_triggers_count: 0,
@@ -992,7 +999,7 @@ impl LlamaModel {
 
         let result = (|| {
             if !status_is_ok(rc) {
-                return Err(ApplyChatTemplateError::FfiError(status_to_i32(rc)));
+                return Err(ApplyChatTemplateError::FfiError(rc));
             }
             if raw_result.prompt.is_null() {
                 return Err(ApplyChatTemplateError::NullResult);
@@ -1017,6 +1024,15 @@ impl LlamaModel {
                     .to_bytes()
                     .to_vec();
                 Some(String::from_utf8(parser_bytes)?)
+            };
+            let generation_prompt = if raw_result.generation_prompt.is_null() {
+                String::new()
+            } else {
+                let generation_prompt_bytes =
+                    unsafe { CStr::from_ptr(raw_result.generation_prompt) }
+                        .to_bytes()
+                        .to_vec();
+                String::from_utf8(generation_prompt_bytes)?
             };
             let grammar_triggers = if raw_result.grammar_triggers_count == 0 {
                 Vec::new()
@@ -1099,7 +1115,7 @@ impl LlamaModel {
                 }
                 parsed
             };
-            let parse_tool_calls = tools_json.map_or(false, |tools| !tools.is_empty());
+            let parse_tool_calls = tools_json.is_some_and(|tools| !tools.is_empty());
             Ok(ChatTemplateResult {
                 prompt,
                 grammar,
@@ -1109,7 +1125,7 @@ impl LlamaModel {
                 additional_stops,
                 chat_format: raw_result.chat_format,
                 parser,
-                thinking_forced_open: raw_result.thinking_forced_open,
+                generation_prompt,
                 parse_tool_calls,
             })
         })();
@@ -1138,8 +1154,8 @@ impl LlamaModel {
             prompt: ptr::null_mut(),
             grammar: ptr::null_mut(),
             parser: ptr::null_mut(),
+            generation_prompt: ptr::null_mut(),
             chat_format: 0,
-            thinking_forced_open: false,
             grammar_lazy: false,
             grammar_triggers: ptr::null_mut(),
             grammar_triggers_count: 0,
@@ -1188,7 +1204,7 @@ impl LlamaModel {
 
         let result = (|| {
             if !status_is_ok(rc) {
-                return Err(ApplyChatTemplateError::FfiError(status_to_i32(rc)));
+                return Err(ApplyChatTemplateError::FfiError(rc));
             }
             if raw_result.prompt.is_null() {
                 return Err(ApplyChatTemplateError::NullResult);
@@ -1213,6 +1229,15 @@ impl LlamaModel {
                     .to_bytes()
                     .to_vec();
                 Some(String::from_utf8(parser_bytes)?)
+            };
+            let generation_prompt = if raw_result.generation_prompt.is_null() {
+                String::new()
+            } else {
+                let generation_prompt_bytes =
+                    unsafe { CStr::from_ptr(raw_result.generation_prompt) }
+                        .to_bytes()
+                        .to_vec();
+                String::from_utf8(generation_prompt_bytes)?
             };
             let grammar_triggers = if raw_result.grammar_triggers_count == 0 {
                 Vec::new()
@@ -1305,7 +1330,7 @@ impl LlamaModel {
                 additional_stops,
                 chat_format: raw_result.chat_format,
                 parser,
-                thinking_forced_open: raw_result.thinking_forced_open,
+                generation_prompt,
                 parse_tool_calls,
             })
         })();
@@ -1324,6 +1349,11 @@ impl ChatTemplateResult {
     ) -> Result<String, ChatParseError> {
         let text_cstr = CString::new(text)?;
         let parser_cstr = self.parser.as_deref().map(CString::new).transpose()?;
+        let generation_prompt_cstr = if self.generation_prompt.is_empty() {
+            None
+        } else {
+            Some(CString::new(self.generation_prompt.as_str())?)
+        };
         let mut out_json: *mut c_char = ptr::null_mut();
         let rc = unsafe {
             llama_cpp_sys_2::llama_rs_chat_parse_to_oaicompat(
@@ -1334,14 +1364,16 @@ impl ChatTemplateResult {
                 parser_cstr
                     .as_ref()
                     .map_or(ptr::null(), |cstr| cstr.as_ptr()),
-                self.thinking_forced_open,
+                generation_prompt_cstr
+                    .as_ref()
+                    .map_or(ptr::null(), |cstr| cstr.as_ptr()),
                 &mut out_json,
             )
         };
 
         let result = (|| {
             if !status_is_ok(rc) {
-                return Err(ChatParseError::FfiError(status_to_i32(rc)));
+                return Err(ChatParseError::FfiError(rc));
             }
             if out_json.is_null() {
                 return Err(ChatParseError::NullResult);
@@ -1357,6 +1389,11 @@ impl ChatTemplateResult {
     /// Initialize a streaming parser for OpenAI-compatible chat deltas.
     pub fn streaming_state_oaicompat(&self) -> Result<ChatParseStateOaicompat, ChatParseError> {
         let parser_cstr = self.parser.as_deref().map(CString::new).transpose()?;
+        let generation_prompt_cstr = if self.generation_prompt.is_empty() {
+            None
+        } else {
+            Some(CString::new(self.generation_prompt.as_str())?)
+        };
         let state = unsafe {
             llama_cpp_sys_2::llama_rs_chat_parse_state_init_oaicompat(
                 self.chat_format,
@@ -1364,7 +1401,9 @@ impl ChatTemplateResult {
                 parser_cstr
                     .as_ref()
                     .map_or(ptr::null(), |cstr| cstr.as_ptr()),
-                self.thinking_forced_open,
+                generation_prompt_cstr
+                    .as_ref()
+                    .map_or(ptr::null(), |cstr| cstr.as_ptr()),
             )
         };
         let state = NonNull::new(state).ok_or(ChatParseError::NullResult)?;

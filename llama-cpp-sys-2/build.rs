@@ -70,19 +70,23 @@ fn get_cargo_target_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(target_dir.to_path_buf())
 }
 
-fn extract_lib_names(out_dir: &Path, build_shared_libs: bool) -> Vec<String> {
-    let lib_pattern = if cfg!(windows) {
-        "*.lib"
-    } else if cfg!(target_os = "macos") {
-        if build_shared_libs {
-            "*.dylib"
-        } else {
-            "*.a"
+fn extract_lib_names(out_dir: &Path, build_shared_libs: bool, target_os: &TargetOs) -> Vec<String> {
+    let lib_pattern = match target_os {
+        TargetOs::Windows(_) => "*.lib",
+        TargetOs::Apple(_) => {
+            if build_shared_libs {
+                "*.dylib"
+            } else {
+                "*.a"
+            }
         }
-    } else if build_shared_libs {
-        "*.so"
-    } else {
-        "*.a"
+        TargetOs::Linux | TargetOs::Android => {
+            if build_shared_libs {
+                "*.so"
+            } else {
+                "*.a"
+            }
+        }
     };
     let libs_dir = out_dir.join("lib*");
     let pattern = libs_dir.join(lib_pattern);
@@ -117,16 +121,17 @@ fn extract_lib_names(out_dir: &Path, build_shared_libs: bool) -> Vec<String> {
     lib_names
 }
 
-fn extract_lib_assets(out_dir: &Path) -> Vec<PathBuf> {
-    let shared_lib_pattern = if cfg!(windows) {
-        "*.dll"
-    } else if cfg!(target_os = "macos") {
-        "*.dylib"
-    } else {
-        "*.so"
+fn extract_lib_assets(out_dir: &Path, target_os: &TargetOs) -> Vec<PathBuf> {
+    let shared_lib_pattern = match target_os {
+        TargetOs::Windows(_) => "*.dll",
+        TargetOs::Apple(_) => "*.dylib",
+        TargetOs::Linux | TargetOs::Android => "*.so",
     };
 
-    let shared_libs_dir = if cfg!(windows) { "bin" } else { "lib" };
+    let shared_libs_dir = match target_os {
+        TargetOs::Windows(_) => "bin",
+        _ => "lib",
+    };
     let libs_dir = out_dir.join(shared_libs_dir);
     let pattern = libs_dir.join(shared_lib_pattern);
     debug_log!("Extract lib assets {}", pattern.display());
@@ -142,6 +147,40 @@ fn extract_lib_assets(out_dir: &Path) -> Vec<PathBuf> {
     }
 
     files
+}
+
+fn library_file_exists(
+    search_dirs: &[PathBuf],
+    lib_name: &str,
+    build_shared_libs: bool,
+    target_os: &TargetOs,
+) -> bool {
+    let (prefixes, extensions): (&[&str], &[&str]) = match target_os {
+        TargetOs::Windows(_) => (&["", "lib"], &["lib"]),
+        TargetOs::Apple(_) => {
+            if build_shared_libs {
+                (&["lib"], &["dylib"])
+            } else {
+                (&["lib"], &["a"])
+            }
+        }
+        TargetOs::Linux | TargetOs::Android => {
+            if build_shared_libs {
+                (&["lib"], &["so"])
+            } else {
+                (&["lib"], &["a"])
+            }
+        }
+    };
+
+    search_dirs.iter().any(|dir| {
+        prefixes.iter().any(|prefix| {
+            extensions.iter().any(|extension| {
+                dir.join(format!("{prefix}{lib_name}.{extension}"))
+                    .is_file()
+            })
+        })
+    })
 }
 
 fn macos_link_search_path() -> Option<String> {
@@ -560,8 +599,8 @@ fn main() {
         // if `target-cpu` is set set, also set -march for llama.cpp to the same value
         if let Some(ref cpu) = target_cpu {
             debug_log!("Setting baseline architecture: -march={}", cpu);
-            config.cflag(&format!("-march={}", cpu));
-            config.cxxflag(&format!("-march={}", cpu));
+            config.cflag(format!("-march={}", cpu));
+            config.cxxflag(format!("-march={}", cpu));
         }
 
         // I expect this env var to always be present
@@ -815,6 +854,18 @@ fn main() {
         config.define("LLAMA_USE_SYSTEM_GGML", "ON");
     }
 
+    if cfg!(feature = "dynamic-backends") {
+        // Pre-create the backends directory so CMake can install MODULE libs there.
+        // GGML_BACKEND_DIR causes backends to install to this known path instead of
+        // CMAKE_INSTALL_BINDIR, making them easy to locate in downstream build scripts.
+        let backends_dir = out_dir.join("backends");
+        std::fs::create_dir_all(&backends_dir).unwrap();
+        config.define("GGML_BACKEND_DL", "ON");
+        config.define("GGML_CPU_ALL_VARIANTS", "ON");
+        config.define("GGML_BACKEND_DIR", backends_dir.to_str().unwrap());
+        // BUILD_SHARED_LIBS=ON is already set above via the dynamic-link feature.
+    }
+
     // General
     config
         .profile(&profile)
@@ -822,6 +873,10 @@ fn main() {
         .always_configure(false);
 
     let build_dir = config.build();
+
+    if cfg!(feature = "dynamic-backends") {
+        println!("cargo:backends_dir={}", out_dir.join("backends").display());
+    }
 
     // Build mtmd directly with cc::Build, bypassing the cmake tools build.
     // Using LLAMA_BUILD_TOOLS=ON would pull in all tools (batched-bench, quantize, etc.)
@@ -981,12 +1036,15 @@ fn main() {
     }
 
     // Link libraries
-    let llama_libs_kind = if build_shared_libs || cfg!(feature = "system-ggml") {
+    let llama_libs_kind = if build_shared_libs
+        || (cfg!(feature = "system-ggml") && !cfg!(feature = "system-ggml-static"))
+    {
         "dylib"
     } else {
         "static"
     };
-    let mut llama_libs = extract_lib_names(&out_dir, build_shared_libs);
+
+    let llama_libs = extract_lib_names(&out_dir, build_shared_libs, &target_os);
 
     assert_ne!(llama_libs.len(), 0);
 
@@ -996,14 +1054,40 @@ fn main() {
             "cargo:rustc-link-search=native={}",
             common_lib_dir.display()
         );
+        let mut common_search_dirs = vec![common_lib_dir.clone()];
         let common_profile_dir = common_lib_dir.join(&profile);
         if common_profile_dir.is_dir() {
             println!(
                 "cargo:rustc-link-search=native={}",
                 common_profile_dir.display()
             );
+            common_search_dirs.push(common_profile_dir);
         }
-        println!("cargo:rustc-link-lib=static=common");
+
+        if library_file_exists(
+            &common_search_dirs,
+            "llama-common",
+            build_shared_libs,
+            &target_os,
+        ) {
+            println!("cargo:rustc-link-lib={llama_libs_kind}=llama-common");
+            if library_file_exists(
+                &common_search_dirs,
+                "llama-common-base",
+                build_shared_libs,
+                &target_os,
+            ) {
+                println!("cargo:rustc-link-lib={llama_libs_kind}=llama-common-base");
+            }
+        } else if library_file_exists(&common_search_dirs, "common", build_shared_libs, &target_os)
+        {
+            println!("cargo:rustc-link-lib={llama_libs_kind}=common");
+        } else {
+            println!(
+                "cargo:warning=LLAMA_BUILD_COMMON was enabled, but no common library was found in {}",
+                common_lib_dir.display()
+            );
+        }
     }
 
     if cfg!(feature = "system-ggml") {
@@ -1039,7 +1123,7 @@ fn main() {
         TargetOs::Linux => {
             println!("cargo:rustc-link-lib=dylib=stdc++");
         }
-        TargetOs::Apple(variant) => {
+        TargetOs::Apple(ref variant) => {
             println!("cargo:rustc-link-lib=framework=Foundation");
             println!("cargo:rustc-link-lib=framework=Metal");
             println!("cargo:rustc-link-lib=framework=MetalKit");
@@ -1075,7 +1159,7 @@ fn main() {
 
     // copy DLLs to target
     if build_shared_libs {
-        let libs_assets = extract_lib_assets(&out_dir);
+        let libs_assets = extract_lib_assets(&out_dir, &target_os);
         for asset in libs_assets {
             let asset_clone = asset.clone();
             let filename = asset_clone.file_name().unwrap();
